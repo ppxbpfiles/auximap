@@ -7,6 +7,9 @@
 **auximap** は、ファイラー「Paper Plane xUI (PPx)」の画面上でメール（IMAP）をファイルのように扱い、メールボックス内のファイルやフォルダの確認・整理・移動・削除などを行うためのツールです。  
 PPx の `aux:` パス機能を利用し、メールサーバー上のメールボックスを仮想フォルダとして一覧・操作できます（※おまけとして Emacs 用の連携スクリプト `auximap.el` も同梱しています）。
 
+<img width="975" height="555" alt="image" src="https://github.com/user-attachments/assets/16c6d45e-54e3-4480-8ba6-6a6fa7cbc2e5" />
+
+
 ---
 
 ## 特長
