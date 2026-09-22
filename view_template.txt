@@ -1,0 +1,9 @@
+From   : {from}
+To     : {to}
+Cc     : {cc}
+Date   : {date}
+Subject: {subject}
+Attach : {attachments}
+--------------------------------------------------------------------------------
+
+{body}

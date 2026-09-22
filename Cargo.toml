@@ -1,0 +1,25 @@
+[package]
+name = "auximap"
+version = "0.3.0"
+edition = "2024"
+description = "Ultra-fast, lightweight IMAP bridge for Paper Plane xUI (PPx) aux: path and Emacs dual-pane viewer"
+license = "MIT"
+readme = "README.md"
+keywords = ["imap", "ppx", "emacs", "mail", "cli"]
+categories = ["command-line-utilities", "email"]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "=0.4.38", default-features = false, features = ["clock", "std"] }
+encoding_rs = "0.8.41"
+imap = "2.4.1"
+mailparse = "0.17.0"
+native-tls = "=0.2.12"
+rust-ini = "0.21.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
