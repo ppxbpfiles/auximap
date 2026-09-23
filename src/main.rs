@@ -5,6 +5,7 @@
 //! PPx の作者である TORO 氏の著作物ではありません。
 //! 本ツールに関するお問い合わせ等を TORO 氏へ行うことはご遠慮ください。
 
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -2015,8 +2016,260 @@ fn parse_cli_args(raw_args: &[String]) -> (Vec<String>, Option<String>, Option<S
     (clean_args, cli_pass, cli_user)
 }
 
+#[derive(Clone, Debug)]
+struct EmailSummaryItem {
+    folder: String,
+    uid: u32,
+    date_str: String,
+    from: String,
+    subject: String,
+    size: usize,
+}
+
+fn cmd_report(
+    target_path: &str,
+    to_trash: bool,
+    cli_limit: Option<u32>,
+    cli_pass: Option<&str>,
+    cli_user: Option<&str>,
+) -> Result<()> {
+    let path_info = parse_mail_path(target_path);
+    let acc_name = path_info.account
+        .ok_or_else(|| anyhow!("Account not specified. Usage: auximap report <account> [folder] [--trash]"))?;
+
+    let (accounts, _) = load_config(cli_pass, cli_user, Some(&acc_name))?;
+    let acc = accounts.iter().find(|a| a.name.eq_ignore_ascii_case(&acc_name))
+        .ok_or_else(|| anyhow!("Account '{}' not found in auximap.ini", acc_name))?;
+
+    let mut session = connect_imap(acc)?;
+
+    let specified_folder = path_info.folder.filter(|f| !f.trim().is_empty());
+    let (is_cross_folder, folders_to_scan) = if let Some(fld) = specified_folder {
+        (false, vec![fld])
+    } else {
+        let mailboxes = session.list(Some(""), Some("*")).context("Failed to list IMAP mailboxes")?;
+        let mut list = Vec::new();
+        for mb in mailboxes.iter() {
+            let decoded = decode_modified_utf7(mb.name());
+            let lower = decoded.to_lowercase();
+            let is_trash_or_junk = mb.attributes().iter().any(|a| {
+                let s = format!("{:?}", a).to_lowercase();
+                s.contains("trash") || s.contains("junk") || s.contains("spam") || s.contains("drafts")
+            }) || lower.ends_with("trash")
+               || lower.contains("ごみ箱") || lower.contains("ゴミ箱")
+               || lower.contains("junk") || lower.contains("spam") || lower.contains("迷惑")
+               || lower.ends_with("drafts") || lower.contains("下書き");
+
+            if !is_trash_or_junk && !decoded.is_empty() {
+                list.push(decoded);
+            }
+        }
+        (true, list)
+    };
+
+    println!("===================================================");
+    if is_cross_folder {
+        println!("  auximap Duplicate Report: [{}] (All Folders: {} mailboxes)", acc.name, folders_to_scan.len());
+    } else {
+        let fld_name = folders_to_scan.first().map(|s| s.as_str()).unwrap_or("INBOX");
+        println!("  auximap Duplicate Report: [{}/{}]", acc.name, fld_name);
+    }
+    let mode_desc = if to_trash {
+        "Move duplicate emails to Trash"
+    } else {
+        "Report only (dry-run)"
+    };
+    println!("  Mode   : {}", mode_desc);
+    println!("===================================================");
+
+    let mut all_items: Vec<EmailSummaryItem> = Vec::new();
+
+    for fld in &folders_to_scan {
+        let imap_folder = encode_modified_utf7(fld);
+        let mailbox = match session.select(&imap_folder) {
+            Ok(mb) => mb,
+            Err(e) => {
+                log_msg(&format!("Failed to select mailbox '{}': {:?}", fld, e));
+                continue;
+            }
+        };
+
+        let total = mailbox.exists;
+        if total == 0 {
+            println!("  [{}] 0 messages", fld);
+            continue;
+        }
+
+        let limit = cli_limit.unwrap_or(acc.limit);
+        let seq_range = calculate_seq_range(total, limit, 0);
+        let (start_seq, end_seq) = match seq_range {
+            Some(range) => range,
+            None => continue,
+        };
+
+        let count = end_seq - start_seq + 1;
+        println!("  Scanning [{}] ({} messages)...", fld, count);
+
+        let range = format!("{}:{}", start_seq, end_seq);
+        let messages = match session.fetch(&range, "(UID RFC822.SIZE INTERNALDATE ENVELOPE)") {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                log_msg(&format!("Failed to fetch headers in [{}]: {:?}", fld, e));
+                continue;
+            }
+        };
+
+        for msg in messages.iter() {
+            let uid = msg.uid.unwrap_or(0);
+            let size = msg.size.unwrap_or(0) as usize;
+            let date_str = format_message_date(msg, &acc.timezone, &acc.date_source);
+
+            let mut from_name = String::new();
+            let mut from_addr = String::new();
+            let mut subject_str = String::from("(no subject)");
+
+            if let Some(env) = msg.envelope() {
+                if let Some(from_list) = &env.from {
+                    if let Some(first_from) = from_list.first() {
+                        from_name = first_from.name.as_deref().map(decode_mime_header).unwrap_or_default();
+                        let mailbox = first_from.mailbox.as_deref().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+                        let host = first_from.host.as_deref().map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+
+                        if !mailbox.is_empty() && !host.is_empty() {
+                            from_addr = format!("{}@{}", mailbox, host);
+                        }
+                    }
+                }
+                if let Some(subj) = &env.subject {
+                    subject_str = decode_mime_header(subj);
+                }
+            }
+
+            let from_combined = if !from_name.is_empty() && !from_addr.is_empty() {
+                if from_name.eq_ignore_ascii_case(&from_addr) {
+                    from_addr
+                } else {
+                    format!("{} ({})", from_name, from_addr)
+                }
+            } else if !from_name.is_empty() {
+                from_name
+            } else if !from_addr.is_empty() {
+                from_addr
+            } else {
+                String::from("unknown")
+            };
+
+            all_items.push(EmailSummaryItem {
+                folder: fld.clone(),
+                uid,
+                date_str,
+                from: from_combined,
+                subject: subject_str,
+                size,
+            });
+        }
+    }
+
+    let total_scanned = all_items.len();
+    if total_scanned == 0 {
+        println!("No messages found to check.");
+        println!("===================================================");
+        return Ok(());
+    }
+
+    let mut order = Vec::new();
+    let mut groups: HashMap<String, Vec<EmailSummaryItem>> = HashMap::new();
+
+    for item in all_items {
+        let key = format!("{}|{}|{}|{}", item.date_str, item.from.trim().to_lowercase(), item.subject.trim(), item.size);
+        if let Some(list) = groups.get_mut(&key) {
+            list.push(item);
+        } else {
+            groups.insert(key.clone(), vec![item]);
+            order.push(key);
+        }
+    }
+
+    let mut dup_groups = Vec::new();
+    let mut dup_items = Vec::new();
+
+    for key in &order {
+        if let Some(items) = groups.get(key) {
+            if items.len() > 1 {
+                let mut sorted_items = items.clone();
+                if is_cross_folder {
+                    sorted_items.sort_by(|a, b| {
+                        let a_is_inbox = a.folder.eq_ignore_ascii_case("INBOX");
+                        let b_is_inbox = b.folder.eq_ignore_ascii_case("INBOX");
+                        match (a_is_inbox, b_is_inbox) {
+                            (true, false) => std::cmp::Ordering::Greater,
+                            (false, true) => std::cmp::Ordering::Less,
+                            _ => a.uid.cmp(&b.uid),
+                        }
+                    });
+                }
+                for item in &sorted_items[1..] {
+                    dup_items.push(item.clone());
+                }
+                dup_groups.push(sorted_items);
+            }
+        }
+    }
+
+    println!();
+    if dup_groups.is_empty() {
+        println!("No duplicate emails found.");
+        println!("===================================================");
+        return Ok(());
+    }
+
+    for (idx, group) in dup_groups.iter().enumerate() {
+        let keep = &group[0];
+        println!("[DUP #{}]", idx + 1);
+        println!("  Date   : {}", keep.date_str);
+        println!("  From   : {}", keep.from);
+        println!("  Subject: {}", keep.subject);
+        println!("  Keep   : [{}] UID {} ({})", keep.folder, keep.uid, format_bytes_human(keep.size));
+        for (d_idx, dup) in group[1..].iter().enumerate() {
+            println!("  Dup #{}: [{}] UID {} ({})", d_idx + 1, dup.folder, dup.uid, format_bytes_human(dup.size));
+        }
+        println!();
+    }
+
+    println!("===================================================");
+    println!("Duplicate Summary: {} messages scanned", total_scanned);
+    println!("  - Unique Messages : {}", order.len());
+    println!("  - Duplicate Groups: {}", dup_groups.len());
+    println!("  - Duplicate Items : {}", dup_items.len());
+    println!("===================================================");
+
+    if to_trash && !dup_items.is_empty() {
+        let mut by_folder: HashMap<String, Vec<u32>> = HashMap::new();
+        for item in &dup_items {
+            by_folder.entry(item.folder.clone()).or_default().push(item.uid);
+        }
+
+        let mut moved_count = 0;
+        for (fld, uids) in by_folder {
+            println!("Moving {} duplicate email(s) from [{}] to Trash...", uids.len(), fld);
+            match cmd_delete_multi(&acc.name, &fld, &uids, cli_pass, cli_user) {
+                Ok(_) => {
+                    moved_count += uids.len();
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to move duplicates in [{}]: {:#}", fld, e);
+                }
+            }
+        }
+        println!("Successfully moved {} duplicate email(s) to Trash.", moved_count);
+        log_msg(&format!("[{}] Moved {} duplicate emails to trash", acc.name, moved_count));
+    }
+
+    Ok(())
+}
+
 fn print_help() {
-    println!("auximap v0.3.1 - PPx aux: path IMAP bridge");
+    println!("auximap v0.4.0 - PPx aux: path IMAP bridge");
     println!("A lightweight CLI bridge between Paper Plane xUI (PPx) aux: path and IMAP mail.");
     println!();
     println!("Copyright (c) 2026 auximap contributors");
@@ -2037,6 +2290,10 @@ fn print_help() {
     println!("         Move email between folders/accounts.");
     println!("  delete <src_file> | <account/folder> <uid1> [uid2...]");
     println!("         Delete email(s) or move to Trash.");
+    println!("  report <account> [folder] [--trash] [--limit N]");
+    println!("         Detect duplicate emails across all folders (or in single folder).");
+    println!("         Default: Report only (dry-run).");
+    println!("         --trash: Move duplicate emails to Trash.");
     println!("  makedir <account/folder>");
     println!("         Create a mailbox / IMAP folder.");
     println!("  deldir  <account/folder>");
@@ -2272,6 +2529,27 @@ fn main() {
                 let src = &args[2];
                 let dest = &args[3];
                 cmd_rename(src, dest, pass_ref, user_ref)
+            }
+        }
+        "report" | "dedup" | "dup" => {
+            if args.len() < 3 {
+                Err(anyhow!("Usage: auximap report <account> [folder] [--trash] [--limit N]"))
+            } else {
+                let target = &args[2];
+                let mut to_trash = false;
+                let mut limit = None;
+                let mut i = 3;
+                while i < args.len() {
+                    let arg = &args[i];
+                    if arg == "--trash" || arg == "-trash" {
+                        to_trash = true;
+                    } else if (arg == "--limit" || arg == "-l") && i + 1 < args.len() {
+                        i += 1;
+                        limit = args[i].parse::<u32>().ok();
+                    }
+                    i += 1;
+                }
+                cmd_report(target, to_trash, limit, pass_ref, user_ref)
             }
         }
         _ => Err(anyhow!("Unknown command: {}", command)),

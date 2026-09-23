@@ -1,6 +1,6 @@
 [package]
 name = "auximap"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Ultra-fast, lightweight IMAP bridge for Paper Plane xUI (PPx) aux: path and Emacs dual-pane viewer"
 license = "MIT"

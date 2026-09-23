@@ -2,7 +2,7 @@
 
 ;; Author: auximap contributors
 ;; Keywords: mail, imap, preview, dired
-;; Version: 0.3.1
+;; Version: 0.4.0
 ;;
 ;;; Commentary:
 ;;
@@ -11,7 +11,8 @@
 ;; with `auximap.exe` as its lightweight, ultra-fast backend.
 ;;
 ;; Features:
-;; - Two-pane view: Email list (top) and Body preview (bottom)
+;; - Two-pane view: Email list (left) and Body preview (right) (configurable: vertical or horizontal)
+;; - Ilist / Imenu integration: Folder tree navigation and quick email jump.
 ;; - Blazing-fast browsing: Move cursor (`n`/`p` or arrow keys) to preview instantly.
 ;; - PPx & Dired style marking:
 ;;   - `SPC`: Mark email with `*` and move down (PPx style)
@@ -33,6 +34,7 @@
 ;;   (require 'auximap)
 ;;   ;; (setq auximap-default-account "your_account") ; auto-detected from auximap.ini if omitted
 ;;   (setq auximap-default-folder  "INBOX")          ; defaults to "INBOX"
+;;   (setq auximap-window-split-direction 'vertical) ; 'vertical (left/right) or 'horizontal (top/bottom)
 ;;   (global-set-key (kbd "<f9>") 'auximap-toggle)
 ;;
 ;;   ;; 2. Using use-package
@@ -41,7 +43,8 @@
 ;;     :bind ("<f9>" . auximap-toggle)
 ;;     :custom
 ;;     ;; (auximap-default-account "your_account")
-;;     (auximap-default-folder "INBOX"))
+;;     (auximap-default-folder "INBOX")
+;;     (auximap-window-split-direction 'vertical))
 ;;
 ;;   ;; Note: auximap.exe is automatically detected from PATH or .emacs.d/../bin/
 ;;   ;; You can specify manually if needed:
@@ -54,6 +57,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'imenu)
 
 (defgroup auximap nil
   "Fast IMAP reader using auximap.exe backend."
@@ -94,8 +98,16 @@ If nil, the first account defined in auximap.ini will be used automatically."
   :type 'directory
   :group 'auximap)
 
-(defcustom auximap-window-split-ratio 0.45
-  "Fraction of the frame height allocated to the email list window."
+(defcustom auximap-window-split-direction 'vertical
+  "Window split direction for email list and preview.
+'vertical splits side-by-side (list on left, preview on right).
+'horizontal splits top-and-bottom (list on top, preview on bottom)."
+  :type '(choice (const :tag "Vertical (Side-by-side: List Left / Preview Right)" vertical)
+                 (const :tag "Horizontal (Above and Below: List Top / Preview Bottom)" horizontal))
+  :group 'auximap)
+
+(defcustom auximap-window-split-ratio 0.65
+  "Fraction of the frame width or height allocated to the email list window."
   :type 'float
   :group 'auximap)
 
@@ -237,7 +249,9 @@ If nil, the first account defined in auximap.ini will be used automatically."
     (delete-other-windows)
     (switch-to-buffer list-buf)
     (let ((list-win (selected-window))
-          (view-win (split-window-below (round (* (window-height) auximap-window-split-ratio)))))
+          (view-win (if (eq auximap-window-split-direction 'vertical)
+                        (split-window-right (round (* (window-width) auximap-window-split-ratio)))
+                      (split-window-below (round (* (window-height) auximap-window-split-ratio))))))
       (set-window-buffer view-win view-buf)
       (with-current-buffer view-buf
         (auximap-view-mode)
@@ -304,6 +318,7 @@ If nil, the first account defined in auximap.ini will be used automatically."
     (define-key map (kbd "r") #'auximap-refresh)
     (define-key map (kbd "f") #'auximap-change-folder)
     (define-key map (kbd "c") #'auximap-change-folder)
+    (define-key map (kbd "i") #'imenu)
     (define-key map (kbd "a") #'auximap-change-account)
     (define-key map (kbd "q") #'auximap-quit)
     (define-key map (kbd "<f1>") #'auximap-help)
@@ -319,7 +334,9 @@ If nil, the first account defined in auximap.ini will be used automatically."
   "Major mode for browsing IMAP email lists with Dired/PPx markings."
   (setq buffer-read-only t)
   (setq truncate-lines t)
-  (hl-line-mode 1))
+  (hl-line-mode 1)
+  (setq-local imenu-create-index-function #'auximap--imenu-create-index)
+  (setq-local imenu-default-goto-function #'auximap--imenu-goto-function))
 
 (defvar auximap-view-mode-map
   (let ((map (make-sparse-keymap)))
@@ -366,7 +383,8 @@ If nil, the first account defined in auximap.ini will be used automatically."
   P         : プレビュー自動ON/OFF
   [管理・更新]
   g / r     : 一覧を再取得        f / c : フォルダ切替
-  a         : アカウント切替      q / F9: 終了・閉じる
+  i         : Imenu (Ilist)       a     : アカウント切替
+  q / F9    : 終了・閉じる
   ----------------------------------------------------------------------
 "
     ("n" auximap-next-email :color blue)
@@ -395,6 +413,7 @@ If nil, the first account defined in auximap.ini will be used automatically."
     ("r" auximap-refresh :color blue)
     ("f" auximap-change-folder :color blue)
     ("c" auximap-change-folder :color blue)
+    ("i" imenu :color blue)
     ("a" auximap-change-account :color blue)
     ("q" nil :color blue)
     ("<escape>" nil :color blue)
@@ -470,6 +489,93 @@ If nil, the first account defined in auximap.ini will be used automatically."
 (defalias 'auximap-reload #'auximap-refresh
   "Reload email list from server and render (alias of `auximap-refresh`).")
 
+(defvar auximap--folder-cache (make-hash-table :test 'equal)
+  "Cache of folder lists per account.")
+
+(defun auximap--fetch-folders (account &optional force-refresh)
+  "Fetch IMAP folder list for ACCOUNT dynamically from server (with cache).
+If FORCE-REFRESH is non-nil, bypass cache and re-query server."
+  (let ((cached (gethash account auximap--folder-cache)))
+    (if (and cached (not force-refresh))
+        cached
+      (let* ((target-dir (or auximap-cache-dir temporary-file-directory))
+             (temp-file (expand-file-name (format "folders_%s.txt" account) target-dir))
+             (folders nil))
+        (unless (file-exists-p target-dir)
+          (make-directory target-dir t))
+        (message "サーバーからフォルダ一覧を取得中 (%s)..." account)
+        (let ((exit-code (auximap--call-process account "list" account temp-file)))
+          (if (and (zerop exit-code) (file-exists-p temp-file))
+              (progn
+                (with-temp-buffer
+                  (let ((coding-system-for-read 'utf-8-dos))
+                    (insert-file-contents temp-file))
+                  (goto-char (point-min))
+                  (while (not (eobp))
+                    (let ((line (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position)))))
+                      (when (and (string-prefix-p "\"" line)
+                                 (string-match "\"\\([^\"]+\\)\"" line))
+                        (push (match-string 1 line) folders)))
+                    (forward-line 1)))
+                (setq folders (nreverse folders))
+                (when folders
+                  (puthash account folders auximap--folder-cache))
+                folders)
+            ;; 取得失敗時の代替リスト
+            (if (string-equal (downcase account) "gmail")
+                '("INBOX" "[Gmail]/送信済みメール" "[Gmail]/下書き" "[Gmail]/ゴミ箱" "[Gmail]/迷惑メール" "[Gmail]/すべてのメール")
+              '("INBOX" "Trash" "Sent" "Drafts" "Junk" "Archive"))))))))
+
+(defun auximap--imenu-goto-function (name position &rest _rest)
+  "Handle imenu selection for auximap."
+  (if (stringp position)
+      (auximap-open-mailbox auximap-current-account position)
+    (let ((fld (get-text-property position 'auximap-folder-target)))
+      (if fld
+          (auximap-open-mailbox auximap-current-account fld)
+        (goto-char position)
+        (when auximap-auto-preview
+          (auximap-preview-current))))))
+
+(defun auximap--imenu-create-index ()
+  "Create imenu index containing folders and email items."
+  (let* ((folders (auximap--fetch-folders auximap-current-account))
+         (folder-items
+          (mapcar (lambda (f)
+                    (let ((marker (make-marker))
+                          (f-pos (save-excursion
+                                   (goto-char (point-min))
+                                   (let ((found nil))
+                                     (while (and (not found) (not (eobp)))
+                                       (if (equal (get-text-property (point) 'auximap-folder-target) f)
+                                           (setq found (point))
+                                         (forward-char 1)))
+                                     found))))
+                      (if f-pos
+                          (progn
+                            (set-marker marker f-pos)
+                            (cons (if (string-equal f auximap-current-folder)
+                                      (format "* %s (現在)" f)
+                                    (format "  %s" f))
+                                  marker))
+                        (cons f (point-min)))))
+                  folders))
+         (email-items nil))
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let ((entry (auximap-current-entry)))
+          (when entry
+            (let* ((subj (plist-get entry :subject))
+                   (from (truncate-string-to-width (plist-get entry :from) 20 0 nil "..."))
+                   (title (format "%-20s | %s" from subj))
+                   (m (point-marker)))
+              (push (cons title m) email-items))))
+        (forward-line 1)))
+    (delq nil
+          (list (when folder-items (cons "フォルダ" folder-items))
+                (when email-items (cons "メール一覧" (nreverse email-items)))))))
+
 (defun auximap--load-entries-from-file (list-file)
   "Parse LIST-FILE into `auximap-all-entries`."
   (let ((entries nil))
@@ -499,15 +605,16 @@ If nil, the first account defined in auximap.ini will be used automatically."
          (saved-uid (when-let ((e (auximap-current-entry))) (plist-get e :uid)))
          (displayed-entries (if auximap-current-filter
                                 (cl-remove-if-not
-                                 (lambda (e)
-                                   (let ((kw (downcase auximap-current-filter))
-                                         (subj (downcase (plist-get e :subject)))
-                                         (from (downcase (plist-get e :from))))
-                                     (or (string-match-p (regexp-quote kw) subj)
-                                         (string-match-p (regexp-quote kw) from))))
-                                 auximap-all-entries)
+                                  (lambda (e)
+                                    (let ((kw (downcase auximap-current-filter))
+                                          (subj (downcase (plist-get e :subject)))
+                                          (from (downcase (plist-get e :from))))
+                                      (or (string-match-p (regexp-quote kw) subj)
+                                          (string-match-p (regexp-quote kw) from))))
+                                  auximap-all-entries)
                               auximap-all-entries))
-         (marked-count (cl-count-if (lambda (e) (plist-get e :mark)) auximap-all-entries)))
+         (marked-count (cl-count-if (lambda (e) (plist-get e :mark)) auximap-all-entries))
+         (folders (auximap--fetch-folders auximap-current-account)))
 
     (erase-buffer)
 
@@ -523,10 +630,32 @@ If nil, the first account defined in auximap.ini will be used automatically."
                           'help-echo "クリックまたは 'r' / 'g' でメール一覧を再取得"
                           'follow-link t)
       (insert " ")
+      (insert-text-button "[📁 フォルダ (f)]"
+                          'action (lambda (_) (auximap-change-folder))
+                          'help-echo "クリックまたは 'f' でフォルダ切替"
+                          'follow-link t)
+      (insert " ")
       (insert-text-button "[❓ ガイド (F1)]"
                           'action (lambda (_) (auximap-help))
                           'help-echo "クリックまたは 'F1' / '?' で操作ガイドを表示"
                           'follow-link t)
+      (insert "\n"))
+
+    ;; Folders bar
+    (when folders
+      (insert (propertize "[フォルダ] " 'face 'font-lock-keyword-face))
+      (dolist (fld folders)
+        (let ((is-curr (string-equal fld auximap-current-folder))
+              (btn-start (point)))
+          (insert-text-button
+           (if is-curr (format "[* %s]" fld) (format "[%s]" fld))
+           'action (let ((f fld))
+                     (lambda (_) (auximap-open-mailbox auximap-current-account f)))
+           'help-echo (format "クリックして %s を開く" fld)
+           'follow-link t)
+          (add-text-properties btn-start (point)
+                               (list 'auximap-folder-target fld))
+          (insert " ")))
       (insert "\n"))
 
     ;; Column titles
@@ -561,7 +690,8 @@ If nil, the first account defined in auximap.ini will be used automatically."
 
     ;; Restore cursor position
     (goto-char (point-min))
-    (forward-line 3)
+    (while (and (not (eobp)) (null (auximap-current-entry)))
+      (forward-line 1))
     (when saved-uid
       (while (and (not (eobp))
                   (let ((e (auximap-current-entry)))
@@ -844,43 +974,6 @@ If nil, the first account defined in auximap.ini will be used automatically."
   (auximap-view-quit-to-list)
   (auximap-prev-email)
   (auximap-focus-view))
-
-(defvar auximap--folder-cache (make-hash-table :test 'equal)
-  "Cache of folder lists per account.")
-
-(defun auximap--fetch-folders (account &optional force-refresh)
-  "Fetch IMAP folder list for ACCOUNT dynamically from server (with cache).
-If FORCE-REFRESH is non-nil, bypass cache and re-query server."
-  (let ((cached (gethash account auximap--folder-cache)))
-    (if (and cached (not force-refresh))
-        cached
-      (let* ((target-dir (or auximap-cache-dir temporary-file-directory))
-             (temp-file (expand-file-name (format "folders_%s.txt" account) target-dir))
-             (folders nil))
-        (unless (file-exists-p target-dir)
-          (make-directory target-dir t))
-        (message "サーバーからフォルダ一覧を取得中 (%s)..." account)
-        (let ((exit-code (auximap--call-process account "list" account temp-file)))
-          (if (and (zerop exit-code) (file-exists-p temp-file))
-              (progn
-                (with-temp-buffer
-                  (let ((coding-system-for-read 'utf-8-dos))
-                    (insert-file-contents temp-file))
-                  (goto-char (point-min))
-                  (while (not (eobp))
-                    (let ((line (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position)))))
-                      (when (and (string-prefix-p "\"" line)
-                                 (string-match "\"\\([^\"]+\\)\"" line))
-                        (push (match-string 1 line) folders)))
-                    (forward-line 1)))
-                (setq folders (nreverse folders))
-                (when folders
-                  (puthash account folders auximap--folder-cache))
-                folders)
-            ;; 取得失敗時のフォールバック
-            (if (string-equal (downcase account) "gmail")
-                '("INBOX" "[Gmail]/送信済みメール" "[Gmail]/下書き" "[Gmail]/ゴミ箱" "[Gmail]/迷惑メール" "[Gmail]/すべてのメール")
-              '("INBOX" "Trash" "Sent" "Drafts" "Junk" "Archive"))))))))
 
 (defun auximap-change-folder (&optional refresh-folders)
   "Prompt to change IMAP folder with completion.
